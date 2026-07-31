@@ -39,6 +39,28 @@ pub fn build_tcp_packet(
     flags: u8,
     payload: Option<&[u8]>,
 ) -> Bytes {
+    let mut buf = BytesMut::new();
+    build_tcp_packet_into(&mut buf, local_addr, remote_addr, seq, ack, flags, payload);
+    buf.freeze()
+}
+
+/// Build a TCP/IP packet into the provided buffer.
+///
+/// The buffer is cleared and resized to exactly the packet length. If the
+/// buffer's capacity is at least `MAX_PACKET_LEN` (which holds for the pooled
+/// per-connection send buffer), this never reallocates: `resize` memsets the
+/// unused tail to zero and the subsequent `split_to`/`unsplit` operations only
+/// shuffle the existing allocation's bookkeeping. The packet is reassembled
+/// back into `buf` in place, so the caller retains ownership of the buffer.
+pub fn build_tcp_packet_into(
+    buf: &mut BytesMut,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: Option<&[u8]>,
+) {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
         SocketAddr::V6(_) => IPV6_HEADER_LEN,
@@ -47,7 +69,8 @@ pub fn build_tcp_packet(
     let tcp_header_len = TCP_HEADER_LEN + if wscale { 4 } else { 0 }; // nop + wscale
     let tcp_total_len = tcp_header_len + payload.map_or(0, |payload| payload.len());
     let total_len = ip_header_len + tcp_total_len;
-    let mut buf = BytesMut::zeroed(total_len);
+    buf.clear();
+    buf.resize(total_len, 0);
 
     let mut ip_buf = buf.split_to(ip_header_len);
     let mut tcp_buf = buf.split_to(tcp_total_len);
@@ -124,7 +147,7 @@ pub fn build_tcp_packet(
     tcp.set_checksum(u16::from_be_bytes(cksm.checksum()));
 
     ip_buf.unsplit(tcp_buf);
-    ip_buf.freeze()
+    buf.unsplit(ip_buf);
 }
 
 pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)> {

@@ -587,6 +587,7 @@ dependencies = [
 name = "phantun"
 version = "0.8.1"
 dependencies = [
+ "bytes",
  "clap",
  "fake-tcp",
  "log",

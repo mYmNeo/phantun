@@ -1,6 +1,6 @@
 use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::{Socket, Stack};
+use fake_tcp::{BytesMut, Socket, Stack};
 use log::{debug, error, info};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
@@ -8,12 +8,12 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use tokio::time;
 use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
 
-use phantun::UDP_TTL;
+use phantun::{Heartbeat, UDP_TTL};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -170,8 +170,8 @@ async fn main() -> io::Result<()> {
     let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
-
     let main_loop = tokio::spawn(async move {
+        let mut send_buf = BytesMut::zeroed(MAX_PACKET_LEN);
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
@@ -181,7 +181,7 @@ async fn main() -> io::Result<()> {
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
             if let Some(sock) = connections.read().await.get(&udp_remote_addr) {
-                sock.send(&buf_r[..size]).await;
+                sock.send(&buf_r[..size], &mut send_buf).await;
                 continue;
             }
 
@@ -194,7 +194,7 @@ async fn main() -> io::Result<()> {
 
             let sock = Arc::new(sock.unwrap());
             if let Some(ref p) = handshake_packet {
-                if sock.send(p).await.is_none() {
+                if sock.send(p, &mut send_buf).await.is_none() {
                     error!("Failed to send handshake packet to remote, closing connection.");
                     continue;
                 }
@@ -203,7 +203,7 @@ async fn main() -> io::Result<()> {
             }
 
             // send first packet
-            if sock.send(&buf_r[..size]).await.is_none() {
+            if sock.send(&buf_r[..size], &mut send_buf).await.is_none() {
                 continue;
             }
 
@@ -217,7 +217,7 @@ async fn main() -> io::Result<()> {
             // spawn "fastpath" UDP socket and task, this will offload main task
             // from forwarding UDP packets
 
-            let packet_received = Arc::new(Notify::new());
+            let packet_received = Arc::new(Heartbeat::new());
             let quit = CancellationToken::new();
 
             for i in 0..num_cpus {
@@ -226,6 +226,7 @@ async fn main() -> io::Result<()> {
                 let packet_received = packet_received.clone();
 
                 tokio::spawn(async move {
+                    let mut send_buf = BytesMut::zeroed(MAX_PACKET_LEN);
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
                     let mut buf_tcp = [0u8; MAX_PACKET_LEN];
                     // Always reply from the same address that the peer used to communicate with
@@ -260,13 +261,13 @@ async fn main() -> io::Result<()> {
                     loop {
                         tokio::select! {
                             Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
+                                if sock.send(&buf_udp[..size], &mut send_buf).await.is_none() {
                                     debug!("removed fake TCP socket from connections table");
                                     quit.cancel();
                                     return;
                                 }
 
-                                packet_received.notify_one();
+                                packet_received.tick();
                             },
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
@@ -285,7 +286,7 @@ async fn main() -> io::Result<()> {
                                     },
                                 }
 
-                                packet_received.notify_one();
+                                packet_received.tick();
                             },
                             _ = quit.cancelled() => {
                                 debug!("worker {} terminated", i);

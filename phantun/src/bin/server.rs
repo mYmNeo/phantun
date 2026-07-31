@@ -1,6 +1,6 @@
 use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::Stack;
+use fake_tcp::{BytesMut, Stack};
 use log::{debug, error, info};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
 use std::fs;
@@ -8,12 +8,11 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
 use tokio::time;
 use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
 
-use phantun::UDP_TTL;
+use phantun::{Heartbeat, UDP_TTL};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -169,8 +168,8 @@ async fn main() -> io::Result<()> {
     let mut stack = Stack::new(tun, tun_local, tun_local6);
     stack.listen(local_port);
     info!("Listening on {}", local_port);
-
     let main_loop = tokio::spawn(async move {
+        let mut send_buf = BytesMut::zeroed(MAX_PACKET_LEN);
         let mut buf_udp = [0u8; MAX_PACKET_LEN];
         let mut buf_tcp = [0u8; MAX_PACKET_LEN];
 
@@ -178,7 +177,7 @@ async fn main() -> io::Result<()> {
             let sock = Arc::new(stack.accept().await);
             info!("New connection: {}", sock);
             if let Some(ref p) = handshake_packet {
-                if sock.send(p).await.is_none() {
+                if sock.send(p, &mut send_buf).await.is_none() {
                     error!("Failed to send handshake packet to remote, closing connection.");
                     continue;
                 }
@@ -186,7 +185,7 @@ async fn main() -> io::Result<()> {
                 debug!("Sent handshake packet to: {}", sock);
             }
 
-            let packet_received = Arc::new(Notify::new());
+            let packet_received = Arc::new(Heartbeat::new());
             let quit = CancellationToken::new();
             let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
                 "0.0.0.0:0"
@@ -204,17 +203,18 @@ async fn main() -> io::Result<()> {
                 let udp_sock = new_udp_reuseport(local_addr);
 
                 tokio::spawn(async move {
+                    let mut send_buf = BytesMut::zeroed(MAX_PACKET_LEN);
                     udp_sock.connect(remote_addr).await.unwrap();
 
                     loop {
                         tokio::select! {
                             Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
+                                if sock.send(&buf_udp[..size], &mut send_buf).await.is_none() {
                                     quit.cancel();
                                     return;
                                 }
 
-                                packet_received.notify_one();
+                                packet_received.tick();
                             },
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
@@ -232,7 +232,7 @@ async fn main() -> io::Result<()> {
                                     },
                                 }
 
-                                packet_received.notify_one();
+                                packet_received.tick();
                             },
                             _ = quit.cancelled() => {
                                 debug!("worker {} terminated", i);

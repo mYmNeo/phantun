@@ -42,8 +42,11 @@
 
 pub mod packet;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use log::{error, info, trace, warn};
+/// Re-exported so callers can create per-worker `BytesMut` send buffers
+/// (required by [`Socket::send`]'s `buf: &mut BytesMut` parameter).
+pub use bytes::BytesMut;
 use packet::*;
 use pnet::packet::{tcp, Packet};
 use rand::prelude::*;
@@ -65,6 +68,13 @@ const MPMC_BUFFER_LEN: usize = 512;
 const MPSC_BUFFER_LEN: usize = 128;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 
+struct IncomingPacket {
+    raw: Bytes,
+    seq: u32,
+    rst: bool,
+    payload_offset: usize,
+}
+
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct AddrTuple {
     local_addr: SocketAddr,
@@ -81,7 +91,7 @@ impl AddrTuple {
 }
 
 struct Shared {
-    tuples: RwLock<HashMap<AddrTuple, flume::Sender<Bytes>>>,
+    tuples: RwLock<HashMap<AddrTuple, flume::Sender<IncomingPacket>>>,
     listening: RwLock<HashSet<u16>>,
     tun: Vec<Arc<Tun>>,
     ready: mpsc::Sender<Socket>,
@@ -105,7 +115,7 @@ pub enum State {
 pub struct Socket {
     shared: Arc<Shared>,
     tun: Arc<Tun>,
-    incoming: flume::Receiver<Bytes>,
+    incoming: flume::Receiver<IncomingPacket>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     seq: AtomicU32,
@@ -129,8 +139,8 @@ impl Socket {
         remote_addr: SocketAddr,
         ack: Option<u32>,
         state: State,
-    ) -> (Socket, flume::Sender<Bytes>) {
-        let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
+    ) -> (Socket, flume::Sender<IncomingPacket>) {
+        let (incoming_tx, incoming_rx) = flume::bounded::<IncomingPacket>(MPMC_BUFFER_LEN);
 
         (
             Socket {
@@ -164,17 +174,28 @@ impl Socket {
 
     /// Sends a datagram to the other end.
     ///
-    /// This method takes `&self`, and it can be called safely by multiple threads
-    /// at the same time.
+    /// `buf` must have capacity for the assembled TCP/IP packet (≤ [`packet::MAX_PACKET_LEN`]);
+    /// it is cleared and reused on each call. Each caller provides its own buffer — this method
+    /// is lock-free and allocation-free beyond the initial buffer creation.
     ///
     /// A return of `None` means the Tun socket returned an error
     /// and this socket must be closed.
-    pub async fn send(&self, payload: &[u8]) -> Option<()> {
+    pub async fn send(&self, payload: &[u8], buf: &mut BytesMut) -> Option<()> {
         match self.state {
             State::Established => {
-                let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload));
-                self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
-                self.tun.send(&buf).await.ok().and(Some(()))
+                let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
+                let ack = self.ack.load(Ordering::Relaxed);
+                self.last_ack.store(ack, Ordering::Relaxed);
+                packet::build_tcp_packet_into(
+                    buf,
+                    self.local_addr,
+                    self.remote_addr,
+                    seq,
+                    ack,
+                    tcp::TcpFlags::ACK,
+                    Some(payload),
+                );
+                self.tun.send(&buf[..]).await.ok().and(Some(()))
             }
             _ => unreachable!(),
         }
@@ -190,17 +211,15 @@ impl Socket {
     pub async fn recv(&self, buf: &mut [u8]) -> Option<usize> {
         match self.state {
             State::Established => {
-                self.incoming.recv_async().await.ok().and_then(|raw_buf| {
-                    let (_v4_packet, tcp_packet) = parse_ip_packet(&raw_buf).unwrap();
-
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
+                self.incoming.recv_async().await.ok().and_then(|pkt| {
+                    if pkt.rst {
                         info!("Connection {} reset by peer", self);
                         return None;
                     }
 
-                    let payload = tcp_packet.payload();
+                    let payload = &pkt.raw[pkt.payload_offset..];
 
-                    let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
+                    let new_ack = pkt.seq.wrapping_add(payload.len() as u32);
                     let last_ask = self.last_ack.load(Ordering::Relaxed);
                     self.ack.store(new_ack, Ordering::Relaxed);
 
@@ -234,9 +253,9 @@ impl Socket {
                 }
                 State::SynReceived => {
                     let res = time::timeout(TIMEOUT, self.incoming.recv_async()).await;
-                    if let Ok(buf) = res {
-                        let buf = buf.unwrap();
-                        let (_v4_packet, tcp_packet) = parse_ip_packet(&buf).unwrap();
+                    if let Ok(pkt) = res {
+                        let pkt = pkt.unwrap();
+                        let (_v4_packet, tcp_packet) = parse_ip_packet(&pkt.raw).unwrap();
 
                         if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
                             return;
@@ -278,9 +297,9 @@ impl Socket {
                 }
                 State::SynSent => {
                     match time::timeout(TIMEOUT, self.incoming.recv_async()).await {
-                        Ok(buf) => {
-                            let buf = buf.unwrap();
-                            let (_v4_packet, tcp_packet) = parse_ip_packet(&buf).unwrap();
+                        Ok(pkt) => {
+                            let pkt = pkt.unwrap();
+                            let (_v4_packet, tcp_packet) = parse_ip_packet(&pkt.raw).unwrap();
 
                             if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
                                 return None;
@@ -453,7 +472,7 @@ impl Stack {
         shared: Arc<Shared>,
         mut tuples_purge: broadcast::Receiver<AddrTuple>,
     ) {
-        let mut tuples: HashMap<AddrTuple, flume::Sender<Bytes>> = HashMap::new();
+        let mut tuples: HashMap<AddrTuple, flume::Sender<IncomingPacket>> = HashMap::new();
 
         loop {
             let mut buf = BytesMut::zeroed(MAX_PACKET_LEN);
@@ -472,7 +491,10 @@ impl Stack {
 
                             let tuple = AddrTuple::new(local_addr, remote_addr);
                             if let Some(c) = tuples.get(&tuple) {
-                                if c.send_async(buf).await.is_err() {
+                                let seq = tcp_packet.get_sequence();
+                                let rst = (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0;
+                                let payload_offset = buf.len() - tcp_packet.payload().len();
+                                if c.send_async(IncomingPacket { raw: buf, seq, rst, payload_offset }).await.is_err() {
                                     trace!("Cache hit, but receiver already closed, dropping packet");
                                 }
 
@@ -486,11 +508,13 @@ impl Stack {
                                     let tuples = shared.tuples.read().unwrap();
                                     tuples.get(&tuple).cloned()
                                 };
-
                                 if let Some(c) = sender {
                                     trace!("Storing connection information into local tuples");
+                                    let seq = tcp_packet.get_sequence();
+                                    let rst = (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0;
+                                    let payload_offset = buf.len() - tcp_packet.payload().len();
                                     tuples.insert(tuple, c.clone());
-                                    c.send_async(buf).await.unwrap();
+                                    c.send_async(IncomingPacket { raw: buf, seq, rst, payload_offset }).await.unwrap();
                                     continue;
                                 }
                             }
