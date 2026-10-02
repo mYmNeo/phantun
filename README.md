@@ -293,12 +293,26 @@ with these differences:
   sudo pfctl -E
   ```
 
+  Rules loaded with `-a` and the enabled state of `pf` are lost on reboot; re-run the commands
+  (or install a launchd job) after restarting.
+
+  Always pass `-a com.apple/phantun`. A bare `sudo pfctl -f -` replaces the entire main ruleset,
+  dropping the `nat-anchor`/`rdr-anchor "com.apple/*"` hooks from `/etc/pf.conf`, so rules in the
+  anchor are silently never evaluated. Check with `sudo pfctl -sn`: it must list
+  `nat-anchor "com.apple/*"`. If it does not, restore the system ruleset with
+  `sudo pfctl -f /etc/pf.conf` and reload the anchor.
+
 * **Single queue:** `utun` has no multi-queue support, and macOS does not load-balance
   `SO_REUSEPORT`, so each connection is handled by one worker task. Throughput per connection is
   therefore lower than on a multi-core Linux host.
 * **Address conflicts:** if another `utun` interface already uses the same addresses (for example a
   stale Phantun instance), macOS keeps routing to the older interface and the handshake times out.
   Stop the old instance or choose different `--tun-local`/`--tun-peer` addresses.
+* **Handshake times out on the client** (`Waiting for SYN + ACK timed out`, then
+  `Fake TCP connection to (... from 192.168.200.2:PORT to SERVER:PORT) closed`): the SYN is leaving
+  the physical interface un-NATed. Verify with `sudo tcpdump -ni en0 tcp port <server port>`; if the
+  source address is the Tun peer (`192.168.200.2`) instead of your `en0` address, `pf` is disabled
+  or the anchor hooks are missing (see **NAT** above).
 
 [Back to TOC](#table-of-contents)
 
