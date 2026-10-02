@@ -2,7 +2,9 @@ use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{BytesMut, Socket, Stack};
 use log::{debug, error, info};
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
+#[cfg(not(target_os = "macos"))]
+use phantun::utils::assign_ipv6_address;
+use phantun::utils::{new_udp_reuseport, new_udp_worker_sockets, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -10,8 +12,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time;
-use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(not(target_os = "macos"))]
+use tokio_tun::TunBuilder;
+#[cfg(target_os = "macos")]
+use fake_tcp::darwin::TunBuilder;
 
 use phantun::{Heartbeat, UDP_TTL};
 
@@ -151,18 +157,37 @@ async fn main() -> io::Result<()> {
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
 
-    let tun = TunBuilder::new()
-        .name(tun_name) // if name is empty, then it is set by kernel.
-        .up() // or set it up manually using `sudo ip link set <tun-name> up`.
-        .address(tun_local)
-        .destination(tun_peer)
-        .queues(num_cpus)
-        .build()
-        .unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let tun = {
+        let tun = TunBuilder::new()
+            .name(tun_name) // if name is empty, then it is set by kernel.
+            .up() // or set it up manually using `sudo ip link set <tun-name> up`.
+            .address(tun_local)
+            .destination(tun_peer)
+            .queues(num_cpus)
+            .build()
+            .unwrap();
 
-    if remote_addr.is_ipv6() {
-        assign_ipv6_address(tun[0].name(), tun_local6.unwrap(), tun_peer6.unwrap());
-    }
+        if remote_addr.is_ipv6() {
+            assign_ipv6_address(tun[0].name(), tun_local6.unwrap(), tun_peer6.unwrap());
+        }
+        tun
+    };
+
+    #[cfg(target_os = "macos")]
+    let tun = {
+        // utun is single-queue; IPv6 is configured by the builder (no netlink on macOS).
+        let mut builder = TunBuilder::new()
+            .name(tun_name) // must be utunN; if empty, then it is set by kernel.
+            .address(tun_local)
+            .destination(tun_peer);
+        if remote_addr.is_ipv6() {
+            builder = builder
+                .address6(tun_local6.unwrap())
+                .destination6(tun_peer6.unwrap());
+        }
+        builder.build().unwrap()
+    };
 
     info!("Created TUN device {}", tun[0].name());
 
@@ -202,6 +227,37 @@ async fn main() -> io::Result<()> {
                 debug!("Sent handshake packet to: {}", sock);
             }
 
+            // Always reply from the same address that the peer used to communicate with
+            // us. This avoids a frequent problem with IPv6 privacy extensions when we
+            // erroneously bind to wrong short-lived temporary address even if the peer
+            // explicitly used a persistent address to communicate to us.
+            //
+            // To do so, first bind to (<incoming packet dst_ip>, <local addr port>), and then
+            // connect to (<incoming packet src_ip>, <incoming packet src_port>).
+            let bind_addr = match (udp_remote_addr, udp_local_addr) {
+                (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
+                    SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
+                }
+                (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
+                    SocketAddr::V6(SocketAddrV6::new(
+                        udp_local_ipv6,
+                        local_addr.port(),
+                        udp_remote_addr.flowinfo(),
+                        udp_remote_addr.scope_id(),
+                    ))
+                }
+                (_, _) => {
+                    panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
+                }
+            };
+            let udp_socks = match new_udp_worker_sockets(bind_addr, udp_remote_addr, num_cpus).await {
+                Ok(socks) => socks,
+                Err(e) => {
+                    error!("Unable to create UDP sockets for {}: {}", udp_remote_addr, e);
+                    continue;
+                }
+            };
+
             // send first packet
             if sock.send(&buf_r[..size], &mut send_buf).await.is_none() {
                 continue;
@@ -220,7 +276,7 @@ async fn main() -> io::Result<()> {
             let packet_received = Arc::new(Heartbeat::new());
             let quit = CancellationToken::new();
 
-            for i in 0..num_cpus {
+            for (i, udp_sock) in udp_socks.into_iter().enumerate() {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
@@ -229,34 +285,6 @@ async fn main() -> io::Result<()> {
                     let mut send_buf = BytesMut::zeroed(MAX_PACKET_LEN);
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
                     let mut buf_tcp = [0u8; MAX_PACKET_LEN];
-                    // Always reply from the same address that the peer used to communicate with
-                    // us. This avoids a frequent problem with IPv6 privacy extensions when we
-                    // erroneously bind to wrong short-lived temporary address even if the peer
-                    // explicitly used a persistent address to communicate to us.
-                    //
-                    // To do so, first bind to (<incoming packet dst_ip>, <local addr port>), and then
-                    // connect to (<incoming packet src_ip>, <incoming packet src_port>).
-                    let bind_addr = match (udp_remote_addr, udp_local_addr) {
-                        (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(
-                                udp_local_ipv4,
-                                local_addr.port(),
-                            ))
-                        }
-                        (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
-                            SocketAddr::V6(SocketAddrV6::new(
-                                udp_local_ipv6,
-                                local_addr.port(),
-                                udp_remote_addr.flowinfo(),
-                                udp_remote_addr.scope_id(),
-                            ))
-                        }
-                        (_, _) => {
-                            panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
-                        }
-                    };
-                    let udp_sock = new_udp_reuseport(bind_addr);
-                    udp_sock.connect(udp_remote_addr).await.unwrap();
 
                     loop {
                         tokio::select! {

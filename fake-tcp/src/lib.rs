@@ -40,6 +40,9 @@
 
 #![cfg_attr(feature = "benchmark", feature(test))]
 
+#[cfg(target_os = "macos")]
+pub mod darwin;
+
 pub mod packet;
 
 use bytes::Bytes;
@@ -60,6 +63,10 @@ use std::sync::{
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::time;
+
+#[cfg(target_os = "macos")]
+use crate::darwin::Tun;
+#[cfg(not(target_os = "macos"))]
 use tokio_tun::Tun;
 
 const TIMEOUT: time::Duration = time::Duration::from_secs(1);
@@ -376,10 +383,11 @@ impl fmt::Display for Socket {
 
 /// A userspace TCP state machine
 impl Stack {
-    /// Create a new stack, `tun` is an array of [`Tun`](tokio_tun::Tun).
-    /// When more than one [`Tun`](tokio_tun::Tun) object is passed in, same amount
+    /// Create a new stack, `tun` is an array of `Tun` devices (`tokio_tun::Tun` on Linux,
+    /// `darwin::Tun` on macOS). When more than one `Tun` object is passed in, same amount
     /// of reader will be spawned later. This allows user to utilize the performance
-    /// benefit of Multiqueue Tun support on machines with SMP.
+    /// benefit of Multiqueue Tun support on machines with SMP (Linux only; macOS `utun`
+    /// is always single-queue).
     pub fn new(tun: Vec<Tun>, local_ip: Ipv4Addr, local_ip6: Option<Ipv6Addr>) -> Stack {
         let tun: Vec<Arc<Tun>> = tun.into_iter().map(Arc::new).collect();
         let (ready_tx, ready_rx) = mpsc::channel(MPSC_BUFFER_LEN);

@@ -2,15 +2,21 @@ use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{BytesMut, Stack};
 use log::{debug, error, info};
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
+#[cfg(not(target_os = "macos"))]
+use phantun::utils::assign_ipv6_address;
+use phantun::utils::new_udp_worker_sockets;
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::time;
-use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(not(target_os = "macos"))]
+use tokio_tun::TunBuilder;
+#[cfg(target_os = "macos")]
+use fake_tcp::darwin::TunBuilder;
 
 use phantun::{Heartbeat, UDP_TTL};
 
@@ -149,18 +155,35 @@ async fn main() -> io::Result<()> {
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
 
-    let tun = TunBuilder::new()
-        .name(tun_name) // if name is empty, then it is set by kernel.
-        .up() // or set it up manually using `sudo ip link set <tun-name> up`.
-        .address(tun_local)
-        .destination(tun_peer)
-        .queues(num_cpus)
-        .build()
-        .unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let tun = {
+        let tun = TunBuilder::new()
+            .name(tun_name) // if name is empty, then it is set by kernel.
+            .up() // or set it up manually using `sudo ip link set <tun-name> up`.
+            .address(tun_local)
+            .destination(tun_peer)
+            .queues(num_cpus)
+            .build()
+            .unwrap();
 
-    if let (Some(tun_local6), Some(tun_peer6)) = (tun_local6, tun_peer6) {
-        assign_ipv6_address(tun[0].name(), tun_local6, tun_peer6);
-    }
+        if let (Some(tun_local6), Some(tun_peer6)) = (tun_local6, tun_peer6) {
+            assign_ipv6_address(tun[0].name(), tun_local6, tun_peer6);
+        }
+        tun
+    };
+
+    #[cfg(target_os = "macos")]
+    let tun = {
+        // utun is single-queue; IPv6 is configured by the builder (no netlink on macOS).
+        let mut builder = TunBuilder::new()
+            .name(tun_name) // must be utunN; if empty, then it is set by kernel.
+            .address(tun_local)
+            .destination(tun_peer);
+        if let (Some(tun_local6), Some(tun_peer6)) = (tun_local6, tun_peer6) {
+            builder = builder.address6(tun_local6).destination6(tun_peer6);
+        }
+        builder.build().unwrap()
+    };
 
     info!("Created TUN device {}", tun[0].name());
 
@@ -196,15 +219,21 @@ async fn main() -> io::Result<()> {
             let local_addr = udp_sock.local_addr()?;
             drop(udp_sock);
 
-            for i in 0..num_cpus {
+            let udp_socks = match new_udp_worker_sockets(local_addr, remote_addr, num_cpus).await {
+                Ok(socks) => socks,
+                Err(e) => {
+                    error!("Unable to create UDP sockets to {}: {}", remote_addr, e);
+                    continue;
+                }
+            };
+
+            for (i, udp_sock) in udp_socks.into_iter().enumerate() {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
-                let udp_sock = new_udp_reuseport(local_addr);
 
                 tokio::spawn(async move {
                     let mut send_buf = BytesMut::zeroed(MAX_PACKET_LEN);
-                    udp_sock.connect(remote_addr).await.unwrap();
 
                     loop {
                         tokio::select! {

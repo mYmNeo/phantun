@@ -88,3 +88,36 @@ jobs:
           files: target/${{ matrix.target }}/release/*.zip
           prerelease: ${{ contains(github.ref, '-') }}
           update_existing: true
+
+  build-macos:
+    runs-on: macos-latest
+    env:
+      RUST_BACKTRACE: full
+    strategy:
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Rename artifacts and compress
+        run: |
+          cd target/${{ matrix.target }}/release
+          mv client phantun_client
+          mv server phantun_server
+          zip phantun_${{ matrix.target }}.zip phantun_client phantun_server
+
+      - name: Upload Github Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/${{ matrix.target }}/release/*.zip
+          prerelease: ${{ contains(github.ref, '-') }}
+          update_existing: true

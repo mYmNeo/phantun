@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "macos"))]
 use neli::{
     consts::{
         nl::NlmF,
@@ -35,10 +36,18 @@ pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
     udp_sock.set_nonblocking(true).unwrap();
 
     // enable IP_PKTINFO/IPV6_PKTINFO delivery so we know the destination address of incoming
-    // packets
+    // packets. macOS has no IP_PKTINFO for IPv4; IP_RECVDSTADDR carries the same information.
     if local_addr.is_ipv4() {
+        #[cfg(not(target_os = "macos"))]
         nix::sys::socket::setsockopt(&udp_sock, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)
             .unwrap();
+        #[cfg(target_os = "macos")]
+        nix::sys::socket::setsockopt(
+            &udp_sock,
+            nix::sys::socket::sockopt::Ipv4RecvDstAddr,
+            &true,
+        )
+        .unwrap();
     } else {
         nix::sys::socket::setsockopt(
             &udp_sock,
@@ -51,6 +60,36 @@ pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
     udp_sock.bind(&socket2::SockAddr::from(local_addr)).unwrap();
     let udp_sock: std::net::UdpSocket = udp_sock.into();
     udp_sock.try_into().unwrap()
+}
+
+/// Creates the UDP sockets for a connection's fastpath workers (one worker per socket), bound
+/// to `bind_addr` and connected to `remote_addr`.
+///
+/// On Linux this returns `n` `SO_REUSEPORT` sockets and the kernel load-balances datagrams
+/// across them. macOS neither load-balances `SO_REUSEPORT` nor allows a second socket to
+/// connect to the same 4-tuple (`EADDRINUSE`), so it always returns a single socket there.
+pub async fn new_udp_worker_sockets(
+    bind_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    n: usize,
+) -> std::io::Result<Vec<UdpSocket>> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut socks = Vec::with_capacity(n);
+        for _ in 0..n {
+            let sock = new_udp_reuseport(bind_addr);
+            sock.connect(remote_addr).await?;
+            socks.push(sock);
+        }
+        Ok(socks)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = n;
+        let sock = new_udp_reuseport(bind_addr);
+        sock.connect(remote_addr).await?;
+        Ok(vec![sock])
+    }
 }
 
 /// Similiar to `UdpSocket::recv_from()`, but returns a 3rd value `IPAddr`
@@ -99,10 +138,17 @@ pub async fn udp_recv_pktinfo(
     .await
 }
 
+/// Extracts the destination address from `IP_PKTINFO`/`IPV6_PKTINFO` control messages
+/// (`IP_RECVDSTADDR` instead of `IP_PKTINFO` on macOS).
 fn dst_addr_from_cmsgs(cmsgs: CmsgIterator) -> Option<IpAddr> {
     for cmsg in cmsgs {
+        #[cfg(not(target_os = "macos"))]
         if let ControlMessageOwned::Ipv4PacketInfo(pktinfo) = cmsg {
             return Some(Ipv4Addr::from(pktinfo.ipi_addr.s_addr.to_ne_bytes()).into());
+        }
+        #[cfg(target_os = "macos")]
+        if let ControlMessageOwned::Ipv4RecvDstAddr(in_addr) = cmsg {
+            return Some(Ipv4Addr::from(in_addr.s_addr.to_ne_bytes()).into());
         }
         if let ControlMessageOwned::Ipv6PacketInfo(pktinfo) = cmsg {
             return Some(Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr).into());
@@ -112,6 +158,9 @@ fn dst_addr_from_cmsgs(cmsgs: CmsgIterator) -> Option<IpAddr> {
     None
 }
 
+/// Assigns the IPv6 point-to-point address pair to the TUN interface via netlink, as
+/// `tokio-tun` only configures IPv4. On macOS the `utun` builder configures IPv6 itself.
+#[cfg(not(target_os = "macos"))]
 pub fn assign_ipv6_address(device_name: &str, local: Ipv6Addr, peer: Ipv6Addr) {
     let index = nix::net::if_::if_nametoindex(device_name).unwrap();
 

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Phantun is a lightweight, fast UDP-to-TCP obfuscator written in 100% safe Rust (zero `unsafe` blocks). It converts UDP datagrams into fake TCP segments that pass through stateful L3/L4 firewalls and NAT devices — useful where UDP is blocked or throttled but TCP is allowed. The defining design decision: the TCP stack implements **only** enough TCP to satisfy stateful inspection (3-way handshake, per-packet SEQ/ACK, RST on close). There is deliberately **no retransmission, no flow control, and no congestion control**, so datagram semantics (including out-of-order delivery) are fully preserved. It will not pass through L7 proxies.
+Phantun is a lightweight, fast UDP-to-TCP obfuscator written in Rust (the only `unsafe` code is the macOS `utun` FFI in `fake-tcp/src/darwin/`). It converts UDP datagrams into fake TCP segments that pass through stateful L3/L4 firewalls and NAT devices — useful where UDP is blocked or throttled but TCP is allowed. The defining design decision: the TCP stack implements **only** enough TCP to satisfy stateful inspection (3-way handshake, per-packet SEQ/ACK, RST on close). There is deliberately **no retransmission, no flow control, and no congestion control**, so datagram semantics (including out-of-order delivery) are fully preserved. It will not pass through L7 proxies.
 
 Cargo workspace with two crates, both edition 2024:
 
@@ -39,15 +39,16 @@ flowchart LR
 - All checksums (IPv4 header + TCP pseudo-header, v4 and v6) are computed in software via `internet-checksum`; there is no hardware offload to toggle.
 - **Client/server worker-socket asymmetry is intentional**: both sides create a per-worker socket via `new_udp_reuseport` + `connect`, but the *bind address* differs. Client workers bind to the PKTINFO-derived destination IP of the peer's first datagram (`client.rs:238-258`) — replying from the exact address the peer used avoids IPv6 privacy-extension misbinding (comment at `client.rs:231-237`). Server workers all bind a shared ephemeral port discovered via a temporary bind (`server.rs:191-198`), then connect to the fixed `--remote`. Do not "unify" these — the client's per-peer bind is load-bearing for IPv6 correctness.
 - IPv6 TUN addressing is done via `neli` netlink (`assign_ipv6_address` in `phantun/src/utils.rs`) because `tokio-tun` only configures IPv4. Removing it breaks IPv6 silently.
+- **macOS (`cfg(target_os = "macos")`)**: `tokio-tun`/`neli` are replaced by `fake_tcp::darwin::{Tun, TunBuilder}` (utun kernel-control socket, 4-byte big-endian AF header stripped/added via `readv`/`writev`, addresses set with `/sbin/ifconfig`, IPv6 configured by the builder). utun is single-queue, and macOS rejects a second socket `connect`ed to the same 4-tuple (`EADDRINUSE`) and doesn't load-balance `SO_REUSEPORT`, so `new_udp_worker_sockets` returns **one** socket per connection there (N on Linux). IPv4 destination address comes from `IP_RECVDSTADDR` (no `IP_PKTINFO`). `utun` control sockets never signal write readiness, so `Tun::send` retries `ENOBUFS`/`EAGAIN` with a 500µs sleep instead of awaiting `writable()`.
 
 ## Key Directories
 
 | Path | Purpose |
 |---|---|
-| `fake-tcp/src/` | Userspace TCP stack: `lib.rs` (`Stack`, `Socket`, `State`, dispatch, handshake), `packet.rs` (`build_tcp_packet`, `parse_ip_packet`, checksums) |
+| `fake-tcp/src/` | Userspace TCP stack: `lib.rs` (`Stack`, `Socket`, `State`, dispatch, handshake), `packet.rs` (`build_tcp_packet`, `parse_ip_packet`, checksums), `darwin/` (macOS utun `Tun`/`TunBuilder`) |
 | `phantun/src/bin/` | Binary entry points: `client.rs`, `server.rs` |
-| `phantun/src/` | `lib.rs` (exports `utils`, `UDP_TTL`), `utils.rs` (SO_REUSEPORT sockets, PKTINFO recvmsg, netlink IPv6) |
-| `.github/workflows/` | CI: `rust.yml` (clippy+build), `release.yml` (cross-compile releases), `docker.yml` (image build) |
+| `phantun/src/` | `lib.rs` (exports `utils`, `UDP_TTL`), `utils.rs` (SO_REUSEPORT sockets, per-connection worker sockets, PKTINFO recvmsg, netlink IPv6) |
+| `.github/workflows/` | CI: `rust.yml` (clippy+build on Linux and macOS), `release.yml` (cross-compile Linux releases + native macOS builds), `docker.yml` (image build) |
 | `docker/` | `Dockerfile`, `docker-compose.yml` (manual test rig), `phantun.sh` (entrypoint: sysctl + iptables/nftables NAT auto-config) |
 | `debian/`, `rpm/`, `selinux/` | Packaging: debhelper cargo buildsystem, RPM spec (note: spec version lags Cargo.toml), SELinux module extending the `wireguard_t` domain |
 
@@ -108,15 +109,16 @@ Key flags (`-l/--local`, `-r/--remote` required on both): `--tun`, `--tun-local`
 | `fake-tcp/src/lib.rs` | `Stack` (TUN I/O, dispatch, `listen`/`accept`/`connect`), `Socket` (per-connection `send`/`recv`), handshake state machine |
 | `fake-tcp/src/packet.rs` | IP+TCP packet build/parse, software checksums, `MAX_PACKET_LEN`, nightly benchmarks |
 | `phantun/src/bin/client.rs` / `server.rs` | Binary entry points, per-core fastpath, 180s idle reaper |
-| `phantun/src/utils.rs` | `new_udp_reuseport`, `udp_recv_pktinfo`, `assign_ipv6_address` (netlink) |
-| `.github/workflows/rust.yml` | CI gate: clippy + build on stable |
+| `phantun/src/utils.rs` | `new_udp_reuseport`, `new_udp_worker_sockets`, `udp_recv_pktinfo`, `assign_ipv6_address` (netlink, Linux only) |
+| `fake-tcp/src/darwin/tun.rs` | macOS utun device + builder |
+| `.github/workflows/rust.yml` | CI gate: clippy + build on stable, `ubuntu-latest` and `macos-latest` |
 | `docker/phantun.sh` | Reference for required sysctl/iptables setup |
 
 ## Runtime/Tooling Preferences
 
 - **Rust stable ≥ 1.85** required (edition 2024 + workspace resolver 3). No `rust-toolchain` file; CI uses unpinned `stable`. Nightly only for MIPS cross-builds and benchmarks.
-- **Linux only**: depends on TUN devices, `SO_REUSEPORT`, `IP_PKTINFO`, netlink.
-- **Runtime privileges**: `CAP_NET_ADMIN` + the `tun` kernel module; `net.ipv4.ip_forward=1` (and IPv6 forwarding) required.
+- **Platforms**: Linux (TUN devices, `SO_REUSEPORT` load balancing, `IP_PKTINFO`, netlink) and macOS (`utun`, `IP_RECVDSTADDR`, `ifconfig`). Other OSes don't build.
+- **Runtime privileges**: Linux: `CAP_NET_ADMIN` + the `tun` kernel module; `net.ipv4.ip_forward=1` (and IPv6 forwarding) required. macOS: root; `net.inet.ip.forwarding=1` (and `net.inet6.ip6.forwarding=1`), NAT via `pf` (README "macOS").
 - **Protocol compatibility**: client and server should run the **same minor version** — no version negotiation exists (README policy).
 - **MTU**: Phantun adds 12 bytes of overhead vs plain UDP (40-byte IP+TCP vs 28-byte IP+UDP header). E.g. WireGuard over Phantun on a 1500 link: MTU 1428 (IPv4) / 1408 (IPv6). DF is always set — oversized datagrams die silently.
 
@@ -124,5 +126,5 @@ Key flags (`-l/--local`, `-r/--remote` required on both): `--tun`, `--tun-local`
 
 - **There are no unit or integration tests** — no `#[test]`, no `tests/` dirs; "integration tests" is an explicit README future-plan item. CI runs `cargo clippy` + `cargo build` only.
 - The only test-adjacent code: three `#[bench]` functions in `fake-tcp/src/packet.rs` behind `#[cfg(all(test, feature = "benchmark"))]`, requiring nightly (`cargo +nightly bench -p fake-tcp --features benchmark`).
-- **Verification is manual and packet-level**: use the `docker/docker-compose.yml` rig (privileged host-mode client+server pair), the README usage checklist, and `tcpdump` on the Phantun port (the bug-report template asks for exactly that).
+- **Verification is manual and packet-level**: use the `docker/docker-compose.yml` rig (privileged host-mode client+server pair), the README usage checklist, and `tcpdump` on the Phantun port (the bug-report template asks for exactly that). On macOS a single-host rig works without NAT: run server and client with distinct `--tun-local`/`--tun-peer` subnets, point the client's `--remote` at the server's tun peer address, enable `net.inet.ip.forwarding`, and echo UDP through it. Stale `utun` interfaces holding the same addresses capture the routes and make the handshake time out.
 - Practical bar for changes: `cargo clippy` clean, `cargo build --release` succeeds, plus a manual end-to-end run for anything touching the data path, handshake, or NAT interaction.

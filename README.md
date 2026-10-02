@@ -23,6 +23,7 @@ A lightweight and fast UDP to TCP obfuscator.
     * [4. Start Phantun daemon](#4-start-phantun-daemon)
         * [Server](#server)
         * [Client](#client)
+* [macOS](#macos)
 * [MTU overhead](#mtu-overhead)
     * [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
 * [Version compatibility](#version-compatibility)
@@ -61,7 +62,8 @@ connection from the perspective of firewalls/NAT devices.
 Phantun means Phantom TUN, as it is an obfuscator for UDP traffic that does just enough work
 to make it pass through stateful firewall/NATs as TCP packets.
 
-Phantun is written in 100% safe Rust. It has been optimized extensively to scale well on multi-core
+Phantun is written in Rust; the only `unsafe` code is the small FFI layer that drives macOS `utun`
+devices. It has been optimized extensively to scale well on multi-core
 systems and has no issue saturating all available CPU resources on a fast connection.
 See the [Performance](#performance) section for benchmarking results.
 
@@ -252,6 +254,51 @@ RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote exam
 
   Domain name with AAAA record is also supported.
 </details>
+
+[Back to TOC](#table-of-contents)
+
+# macOS
+
+Phantun runs on macOS (Apple Silicon and Intel) using the built-in `utun` driver; no extra kernel
+extension is needed. Build it with `cargo build --release`. The Linux instructions above apply,
+with these differences:
+
+* **Interface names** are always `utunN`. Omit `--tun` to let the kernel pick the next free unit,
+  or pass e.g. `--tun utun9`. Other names are rejected.
+* **Privileges:** run both binaries as root (`sudo`). There is no `setcap` equivalent.
+* **IP forwarding:**
+
+  ```
+  sudo sysctl -w net.inet.ip.forwarding=1
+  sudo sysctl -w net.inet6.ip6.forwarding=1   # only for IPv6
+  ```
+
+* **NAT** uses `pf` in place of iptables/nftables. Load the rules into an anchor under
+  `com.apple/`, which the default `/etc/pf.conf` already evaluates, and enable `pf`.
+  Change `en0` to your physical interface.
+
+  Client:
+
+  ```
+  echo 'nat on en0 inet from 192.168.200.2 to any -> (en0)
+  nat on en0 inet6 from fcc8::2 to any -> (en0)' | sudo pfctl -a com.apple/phantun -f -
+  sudo pfctl -E
+  ```
+
+  Server:
+
+  ```
+  echo 'rdr on en0 inet proto tcp from any to any port 4567 -> 192.168.201.2
+  rdr on en0 inet6 proto tcp from any to any port 4567 -> fcc9::2' | sudo pfctl -a com.apple/phantun -f -
+  sudo pfctl -E
+  ```
+
+* **Single queue:** `utun` has no multi-queue support, and macOS does not load-balance
+  `SO_REUSEPORT`, so each connection is handled by one worker task. Throughput per connection is
+  therefore lower than on a multi-core Linux host.
+* **Address conflicts:** if another `utun` interface already uses the same addresses (for example a
+  stale Phantun instance), macOS keeps routing to the older interface and the handshake times out.
+  Stop the old instance or choose different `--tun-local`/`--tun-peer` addresses.
 
 [Back to TOC](#table-of-contents)
 
