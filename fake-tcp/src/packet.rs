@@ -144,21 +144,28 @@ pub fn build_tcp_packet_into(
 /// Unfolded one's-complement sum of `bytes` taken as native-endian 16-bit
 /// words (RFC 1071 §2(B): the sum is byte-order independent, so the folded
 /// result is stored back with `to_ne_bytes`). An odd trailing byte is padded
-/// with zero. 32-bit words are accumulated into a `u64` without a carry chain,
-/// which LLVM vectorises; overflow needs >16 GiB of input.
+/// with zero. Each 8-byte word is split into two masked halves holding two
+/// zero-extended 16-bit words each (SWAR), so a 32-bit lane can absorb 65536
+/// words before overflowing; inputs here are bounded by `MAX_PACKET_LEN`.
 #[inline(always)]
 fn ones_sum(bytes: &[u8]) -> u64 {
-    let mut chunks = bytes.chunks_exact(4);
-    let mut acc: u64 = 0;
+    const MASK: u64 = 0x0000_ffff_0000_ffff;
+    debug_assert!(bytes.len() <= 0xffff);
+    let mut chunks = bytes.chunks_exact(8);
+    let (mut lo, mut hi) = (0u64, 0u64);
     for c in &mut chunks {
-        acc += u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) as u64;
+        let w = u64::from_ne_bytes(c.try_into().unwrap());
+        lo += w & MASK;
+        hi += (w >> 16) & MASK;
     }
-    let rem = chunks.remainder();
-    if rem.len() >= 2 {
-        acc += u16::from_ne_bytes([rem[0], rem[1]]) as u64;
+    let s = lo + hi;
+    let mut acc = (s & 0xffff_ffff) + (s >> 32);
+    let mut words = chunks.remainder().chunks_exact(2);
+    for w in &mut words {
+        acc += u16::from_ne_bytes([w[0], w[1]]) as u64;
     }
-    if rem.len() & 1 == 1 {
-        acc += u16::from_ne_bytes([rem[rem.len() - 1], 0]) as u64;
+    if let [b] = words.remainder() {
+        acc += u16::from_ne_bytes([*b, 0]) as u64;
     }
     acc
 }
