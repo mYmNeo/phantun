@@ -1,14 +1,13 @@
 use bytes::{Bytes, BytesMut};
 use internet_checksum::Checksum;
-use pnet::packet::Packet;
 use pnet::packet::{ip, ipv4, ipv6, tcp};
-use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
 
 const IPV4_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const TCP_HEADER_LEN: usize = 20;
 pub const MAX_PACKET_LEN: usize = 1500;
+const TCP_PROTOCOL: u8 = ip::IpNextHeaderProtocols::Tcp.0;
 
 pub enum IPPacket<'p> {
     V4(ipv4::Ipv4Packet<'p>),
@@ -46,12 +45,11 @@ pub fn build_tcp_packet(
 
 /// Build a TCP/IP packet into the provided buffer.
 ///
-/// The buffer is cleared and resized to exactly the packet length. If the
+/// The buffer is cleared and filled with exactly the packet bytes. If the
 /// buffer's capacity is at least `MAX_PACKET_LEN` (which holds for the pooled
-/// per-connection send buffer), this never reallocates: `resize` memsets the
-/// unused tail to zero and the subsequent `split_to`/`unsplit` operations only
-/// shuffle the existing allocation's bookkeeping. The packet is reassembled
-/// back into `buf` in place, so the caller retains ownership of the buffer.
+/// per-connection send buffer), this never reallocates. Headers are assembled
+/// on the stack and appended together with the payload, so no byte of the
+/// buffer is written more than once.
 pub fn build_tcp_packet_into(
     buf: &mut BytesMut,
     local_addr: SocketAddr,
@@ -61,93 +59,81 @@ pub fn build_tcp_packet_into(
     flags: u8,
     payload: Option<&[u8]>,
 ) {
-    let ip_header_len = match local_addr {
-        SocketAddr::V4(_) => IPV4_HEADER_LEN,
-        SocketAddr::V6(_) => IPV6_HEADER_LEN,
-    };
+    let payload = payload.unwrap_or(&[]);
     let wscale = (flags & tcp::TcpFlags::SYN) != 0;
     let tcp_header_len = TCP_HEADER_LEN + if wscale { 4 } else { 0 }; // nop + wscale
-    let tcp_total_len = tcp_header_len + payload.map_or(0, |payload| payload.len());
-    let total_len = ip_header_len + tcp_total_len;
-    buf.clear();
-    buf.resize(total_len, 0);
+    let tcp_total_len = tcp_header_len + payload.len();
 
-    let mut ip_buf = buf.split_to(ip_header_len);
-    let mut tcp_buf = buf.split_to(tcp_total_len);
-    assert_eq!(0, buf.len());
-
-    match (local_addr, remote_addr) {
-        (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
-            let mut v4 = ipv4::MutableIpv4Packet::new(&mut ip_buf).unwrap();
-            v4.set_version(4);
-            v4.set_header_length(IPV4_HEADER_LEN as u8 / 4);
-            v4.set_next_level_protocol(ip::IpNextHeaderProtocols::Tcp);
-            v4.set_ttl(64);
-            v4.set_source(*local.ip());
-            v4.set_destination(*remote.ip());
-            v4.set_total_length(total_len.try_into().unwrap());
-            v4.set_flags(ipv4::Ipv4Flags::DontFragment);
-            let mut cksm = Checksum::new();
-            cksm.add_bytes(v4.packet());
-            v4.set_checksum(u16::from_be_bytes(cksm.checksum()));
-        }
-        (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
-            let mut v6 = ipv6::MutableIpv6Packet::new(&mut ip_buf).unwrap();
-            v6.set_version(6);
-            v6.set_payload_length(tcp_total_len.try_into().unwrap());
-            v6.set_next_header(ip::IpNextHeaderProtocols::Tcp);
-            v6.set_hop_limit(64);
-            v6.set_source(*local.ip());
-            v6.set_destination(*remote.ip());
-        }
-        _ => unreachable!(),
-    };
-
-    let mut tcp = tcp::MutableTcpPacket::new(&mut tcp_buf).unwrap();
-    tcp.set_window(0xffff);
-    tcp.set_source(local_addr.port());
-    tcp.set_destination(remote_addr.port());
-    tcp.set_sequence(seq);
-    tcp.set_acknowledgement(ack);
-    tcp.set_flags(flags);
-    tcp.set_data_offset(TCP_HEADER_LEN as u8 / 4 + if wscale { 1 } else { 0 });
-    if wscale {
-        let wscale = tcp::TcpOption::wscale(14);
-        tcp.set_options(&[tcp::TcpOption::nop(), wscale]);
-    }
-
-    if let Some(payload) = payload {
-        tcp.set_payload(payload);
-    }
-
+    // Max header: IPv6 (40) + TCP with options (24).
+    let mut hdr = [0u8; IPV6_HEADER_LEN + TCP_HEADER_LEN + 4];
     let mut cksm = Checksum::new();
-    let ip::IpNextHeaderProtocol(tcp_protocol) = ip::IpNextHeaderProtocols::Tcp;
 
-    match (local_addr, remote_addr) {
+    let ip_header_len = match (local_addr, remote_addr) {
         (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
-            cksm.add_bytes(&local.ip().octets());
-            cksm.add_bytes(&remote.ip().octets());
+            let total_len = (IPV4_HEADER_LEN + tcp_total_len) as u16;
+            let ip = &mut hdr[..IPV4_HEADER_LEN];
+            ip[0] = 0x45; // version 4, IHL 5
+            ip[2..4].copy_from_slice(&total_len.to_be_bytes());
+            ip[6] = 0x40; // DF
+            ip[8] = 64; // TTL
+            ip[9] = TCP_PROTOCOL;
+            ip[12..16].copy_from_slice(&local.ip().octets());
+            ip[16..20].copy_from_slice(&remote.ip().octets());
+            let mut ip_cksm = Checksum::new();
+            ip_cksm.add_bytes(ip);
+            ip[10..12].copy_from_slice(&ip_cksm.checksum());
 
-            let mut pseudo = [0u8, tcp_protocol, 0, 0];
-            pseudo[2..].copy_from_slice(&(tcp_total_len as u16).to_be_bytes());
+            // TCP pseudo-header: src, dst, zero, proto, tcp length.
+            let mut pseudo = [0u8; 12];
+            pseudo[..8].copy_from_slice(&ip[12..20]);
+            pseudo[9] = TCP_PROTOCOL;
+            pseudo[10..12].copy_from_slice(&(tcp_total_len as u16).to_be_bytes());
             cksm.add_bytes(&pseudo);
+            IPV4_HEADER_LEN
         }
         (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
-            cksm.add_bytes(&local.ip().octets());
-            cksm.add_bytes(&remote.ip().octets());
+            let ip = &mut hdr[..IPV6_HEADER_LEN];
+            ip[0] = 0x60; // version 6
+            ip[4..6].copy_from_slice(&(tcp_total_len as u16).to_be_bytes());
+            ip[6] = TCP_PROTOCOL;
+            ip[7] = 64; // hop limit
+            ip[8..24].copy_from_slice(&local.ip().octets());
+            ip[24..40].copy_from_slice(&remote.ip().octets());
 
-            let mut pseudo = [0u8, 0, 0, 0, 0, 0, 0, tcp_protocol];
-            pseudo[0..4].copy_from_slice(&(tcp_total_len as u32).to_be_bytes());
+            // TCP pseudo-header: src, dst, tcp length (u32), zero, next header.
+            let mut pseudo = [0u8; 40];
+            pseudo[..32].copy_from_slice(&ip[8..40]);
+            pseudo[32..36].copy_from_slice(&(tcp_total_len as u32).to_be_bytes());
+            pseudo[39] = TCP_PROTOCOL;
             cksm.add_bytes(&pseudo);
+            IPV6_HEADER_LEN
         }
         _ => unreachable!(),
     };
 
-    cksm.add_bytes(tcp.packet());
-    tcp.set_checksum(u16::from_be_bytes(cksm.checksum()));
+    let header_len = ip_header_len + tcp_header_len;
+    let tcp_hdr = &mut hdr[ip_header_len..header_len];
+    tcp_hdr[0..2].copy_from_slice(&local_addr.port().to_be_bytes());
+    tcp_hdr[2..4].copy_from_slice(&remote_addr.port().to_be_bytes());
+    tcp_hdr[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp_hdr[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp_hdr[12] = ((tcp_header_len / 4) as u8) << 4; // data offset
+    tcp_hdr[13] = flags;
+    tcp_hdr[14..16].copy_from_slice(&0xffffu16.to_be_bytes()); // window
+    if wscale {
+        // NOP, then window scale (kind 3, len 3, shift 14).
+        tcp_hdr[20..24].copy_from_slice(&[1, 3, 3, 14]);
+    }
+    // Header and pseudo-header are even-length, so the payload can be summed
+    // separately without disturbing 16-bit word alignment.
+    cksm.add_bytes(tcp_hdr);
+    cksm.add_bytes(payload);
+    tcp_hdr[16..18].copy_from_slice(&cksm.checksum());
 
-    ip_buf.unsplit(tcp_buf);
-    buf.unsplit(ip_buf);
+    buf.clear();
+    buf.reserve(header_len + payload.len());
+    buf.extend_from_slice(&hdr[..header_len]);
+    buf.extend_from_slice(payload);
 }
 
 pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)> {
