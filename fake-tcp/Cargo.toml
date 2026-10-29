@@ -18,7 +18,6 @@ benchmark = []
 bytes = "1"
 pnet = "0"
 rand = { version = "0", features = ["small_rng"] }
-internet-checksum = "0"
 flume = "0.12"
 tokio = { workspace = true }
 log = { workspace = true }
@@ -28,3 +27,7 @@ tokio-tun = "0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0"
+
+[dev-dependencies]
+# Reference checksum for the wire-format oracle in examples/tx_bench.rs.
+internet-checksum = "0"
