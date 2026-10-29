@@ -151,20 +151,20 @@ pub fn build_tcp_packet_into(
 fn ones_sum(bytes: &[u8]) -> u64 {
     const MASK: u64 = 0x0000_ffff_0000_ffff;
     debug_assert!(bytes.len() <= 0xffff);
-    let mut chunks = bytes.chunks_exact(8);
+    let (chunks, rem) = bytes.as_chunks::<8>();
     let (mut lo, mut hi) = (0u64, 0u64);
-    for c in &mut chunks {
-        let w = u64::from_ne_bytes(c.try_into().unwrap());
+    for c in chunks {
+        let w = u64::from_ne_bytes(*c);
         lo += w & MASK;
         hi += (w >> 16) & MASK;
     }
     let s = lo + hi;
     let mut acc = (s & 0xffff_ffff) + (s >> 32);
-    let mut words = chunks.remainder().chunks_exact(2);
-    for w in &mut words {
-        acc += u16::from_ne_bytes([w[0], w[1]]) as u64;
+    let (words, odd) = rem.as_chunks::<2>();
+    for w in words {
+        acc += u16::from_ne_bytes(*w) as u64;
     }
-    if let [b] = words.remainder() {
+    if let [b] = odd {
         acc += u16::from_ne_bytes([*b, 0]) as u64;
     }
     acc
