@@ -63,82 +63,93 @@ pub fn build_tcp_packet_into(
     let tcp_header_len = TCP_HEADER_LEN + if wscale { 4 } else { 0 }; // nop + wscale
     let tcp_total_len = tcp_header_len + payload.len();
 
+    // Header words are built as native-endian u64s in registers, summed with
+    // `lanes` and then stored, so no header byte is read back from memory
+    // (re-reading narrow stores with wide loads stalls store forwarding).
     // Max header: IPv6 (40) + TCP with options (24).
     let mut hdr = [0u8; IPV6_HEADER_LEN + TCP_HEADER_LEN + 4];
-    let mut sum: u64;
+    let tl = (tcp_total_len as u16).to_be_bytes();
+    // Pseudo-header tail as 16-bit words: (0, proto) + tcp length. IPv4 has
+    // these two words; IPv6 has a 32-bit length (upper half zero since
+    // tcp_total_len < 2^16) and 24 zero bits before the next-header byte.
+    let mut sum = lanes(u64::from_ne_bytes([0, TCP_PROTOCOL, tl[0], tl[1], 0, 0, 0, 0]));
 
     let ip_header_len = match (local_addr, remote_addr) {
         (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
-            let total_len = (IPV4_HEADER_LEN + tcp_total_len) as u16;
-            let ip = &mut hdr[..IPV4_HEADER_LEN];
-            ip[0] = 0x45; // version 4, IHL 5
-            ip[2..4].copy_from_slice(&total_len.to_be_bytes());
-            ip[6] = 0x40; // DF
-            ip[8] = 64; // TTL
-            ip[9] = TCP_PROTOCOL;
-            ip[12..16].copy_from_slice(&local.ip().octets());
-            ip[16..20].copy_from_slice(&remote.ip().octets());
+            let total = ((IPV4_HEADER_LEN + tcp_total_len) as u16).to_be_bytes();
+            let [s0, s1, s2, s3] = local.ip().octets();
+            let [d0, d1, d2, d3] = remote.ip().octets();
+            // version/IHL, TOS, total length, id = 0, flags = DF, frag = 0
+            let w0 = u64::from_ne_bytes([0x45, 0, total[0], total[1], 0, 0, 0x40, 0]);
+            let ttl_proto = u16::from_ne_bytes([64, TCP_PROTOCOL]);
+            let addrs = u64::from_ne_bytes([s0, s1, s2, s3, d0, d1, d2, d3]);
             // Both the IP header checksum and the TCP pseudo-header cover the
-            // address pair; sum it once. The remaining non-zero IP header words
-            // are 0x4500, total_len, 0x4000 (DF) and TTL/proto.
-            let addr_sum = ones_sum(&ip[12..20]);
-            let proto_word = u16::from_ne_bytes([0, TCP_PROTOCOL]) as u64;
-            let ip_sum = addr_sum
-                + u16::from_ne_bytes([0x45, 0]) as u64
-                + u16::from_ne_bytes(total_len.to_be_bytes()) as u64
-                + u16::from_ne_bytes([0x40, 0]) as u64
-                + u16::from_ne_bytes([64, TCP_PROTOCOL]) as u64;
-            ip[10..12].copy_from_slice(&fold_checksum(ip_sum));
-
-            // TCP pseudo-header: src, dst, zero, proto, tcp length.
-            sum = addr_sum
-                + proto_word
-                + u16::from_ne_bytes((tcp_total_len as u16).to_be_bytes()) as u64;
+            // address pair; sum it once.
+            let addr_sum = lanes(addrs);
+            let ip_cksm = fold_checksum(lanes(w0) + ttl_proto as u64 + addr_sum);
+            hdr[0..8].copy_from_slice(&w0.to_ne_bytes());
+            hdr[8..10].copy_from_slice(&ttl_proto.to_ne_bytes());
+            hdr[10..12].copy_from_slice(&ip_cksm);
+            hdr[12..20].copy_from_slice(&addrs.to_ne_bytes());
+            sum += addr_sum;
             IPV4_HEADER_LEN
         }
         (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
-            let ip = &mut hdr[..IPV6_HEADER_LEN];
-            ip[0] = 0x60; // version 6
-            ip[4..6].copy_from_slice(&(tcp_total_len as u16).to_be_bytes());
-            ip[6] = TCP_PROTOCOL;
-            ip[7] = 64; // hop limit
-            ip[8..24].copy_from_slice(&local.ip().octets());
-            ip[24..40].copy_from_slice(&remote.ip().octets());
-
-            // TCP pseudo-header: src, dst, tcp length (u32), zero, next header.
-            let mut pseudo = [0u8; 40];
-            pseudo[..32].copy_from_slice(&ip[8..40]);
-            pseudo[32..36].copy_from_slice(&(tcp_total_len as u32).to_be_bytes());
-            pseudo[39] = TCP_PROTOCOL;
-            sum = ones_sum(&pseudo);
+            let src = local.ip().octets();
+            let dst = remote.ip().octets();
+            // version/traffic class/flow label = 0, payload length, next
+            // header, hop limit
+            let w0 = u64::from_ne_bytes([0x60, 0, 0, 0, tl[0], tl[1], TCP_PROTOCOL, 64]);
+            let a: [u64; 4] = [
+                u64::from_ne_bytes(src[..8].try_into().unwrap()),
+                u64::from_ne_bytes(src[8..].try_into().unwrap()),
+                u64::from_ne_bytes(dst[..8].try_into().unwrap()),
+                u64::from_ne_bytes(dst[8..].try_into().unwrap()),
+            ];
+            hdr[0..8].copy_from_slice(&w0.to_ne_bytes());
+            hdr[8..24].copy_from_slice(&src);
+            hdr[24..40].copy_from_slice(&dst);
+            sum += lanes(a[0]) + lanes(a[1]) + lanes(a[2]) + lanes(a[3]);
             IPV6_HEADER_LEN
         }
         _ => unreachable!(),
     };
 
     let header_len = ip_header_len + tcp_header_len;
-    let tcp_hdr = &mut hdr[ip_header_len..header_len];
-    tcp_hdr[0..2].copy_from_slice(&local_addr.port().to_be_bytes());
-    tcp_hdr[2..4].copy_from_slice(&remote_addr.port().to_be_bytes());
-    tcp_hdr[4..8].copy_from_slice(&seq.to_be_bytes());
-    tcp_hdr[8..12].copy_from_slice(&ack.to_be_bytes());
-    tcp_hdr[12] = ((tcp_header_len / 4) as u8) << 4; // data offset
-    tcp_hdr[13] = flags;
-    tcp_hdr[14..16].copy_from_slice(&0xffffu16.to_be_bytes()); // window
-    if wscale {
-        // NOP, then window scale (kind 3, len 3, shift 14).
-        tcp_hdr[20..24].copy_from_slice(&[1, 3, 3, 14]);
-    }
+    let [p0, p1] = local_addr.port().to_be_bytes();
+    let [q0, q1] = remote_addr.port().to_be_bytes();
+    let [s0, s1, s2, s3] = seq.to_be_bytes();
+    let [a0, a1, a2, a3] = ack.to_be_bytes();
+    let off = ((tcp_header_len / 4) as u8) << 4; // data offset
+    let t0 = u64::from_ne_bytes([p0, p1, q0, q1, s0, s1, s2, s3]);
+    // ack, data offset, flags, window 0xffff
+    let t1 = u64::from_ne_bytes([a0, a1, a2, a3, off, flags, 0xff, 0xff]);
+    // NOP, then window scale (kind 3, len 3, shift 14).
+    let opts = if wscale { [1u8, 3, 3, 14] } else { [0; 4] };
+    sum += lanes(t0) + lanes(t1) + lanes(u32::from_ne_bytes(opts) as u64);
     // Header and pseudo-header are even-length, so the payload can be summed
     // separately without disturbing 16-bit word alignment.
-    sum += ones_sum(tcp_hdr);
     sum += ones_sum(payload);
+
+    let tcp_hdr = &mut hdr[ip_header_len..header_len];
+    tcp_hdr[0..8].copy_from_slice(&t0.to_ne_bytes());
+    tcp_hdr[8..16].copy_from_slice(&t1.to_ne_bytes());
     tcp_hdr[16..18].copy_from_slice(&fold_checksum(sum));
+    if wscale {
+        tcp_hdr[20..24].copy_from_slice(&opts);
+    }
 
     buf.clear();
     buf.reserve(header_len + payload.len());
     buf.extend_from_slice(&hdr[..header_len]);
     buf.extend_from_slice(payload);
+}
+
+/// Sum of the four native-endian 16-bit words packed in `w`, as an unfolded
+/// one's-complement partial sum compatible with [`ones_sum`].
+#[inline(always)]
+fn lanes(w: u64) -> u64 {
+    (w & 0xffff) + ((w >> 16) & 0xffff) + ((w >> 32) & 0xffff) + (w >> 48)
 }
 
 /// Unfolded one's-complement sum of `bytes` taken as native-endian 16-bit
