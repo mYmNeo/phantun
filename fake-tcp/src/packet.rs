@@ -1,5 +1,4 @@
 use bytes::{Bytes, BytesMut};
-use internet_checksum::Checksum;
 use pnet::packet::{ip, ipv4, ipv6, tcp};
 use std::net::{IpAddr, SocketAddr};
 
@@ -66,7 +65,7 @@ pub fn build_tcp_packet_into(
 
     // Max header: IPv6 (40) + TCP with options (24).
     let mut hdr = [0u8; IPV6_HEADER_LEN + TCP_HEADER_LEN + 4];
-    let mut cksm = Checksum::new();
+    let mut sum: u64;
 
     let ip_header_len = match (local_addr, remote_addr) {
         (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
@@ -79,16 +78,15 @@ pub fn build_tcp_packet_into(
             ip[9] = TCP_PROTOCOL;
             ip[12..16].copy_from_slice(&local.ip().octets());
             ip[16..20].copy_from_slice(&remote.ip().octets());
-            let mut ip_cksm = Checksum::new();
-            ip_cksm.add_bytes(ip);
-            ip[10..12].copy_from_slice(&ip_cksm.checksum());
+            let ip_cksm = fold_checksum(ones_sum(ip));
+            ip[10..12].copy_from_slice(&ip_cksm);
 
             // TCP pseudo-header: src, dst, zero, proto, tcp length.
             let mut pseudo = [0u8; 12];
             pseudo[..8].copy_from_slice(&ip[12..20]);
             pseudo[9] = TCP_PROTOCOL;
             pseudo[10..12].copy_from_slice(&(tcp_total_len as u16).to_be_bytes());
-            cksm.add_bytes(&pseudo);
+            sum = ones_sum(&pseudo);
             IPV4_HEADER_LEN
         }
         (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
@@ -105,7 +103,7 @@ pub fn build_tcp_packet_into(
             pseudo[..32].copy_from_slice(&ip[8..40]);
             pseudo[32..36].copy_from_slice(&(tcp_total_len as u32).to_be_bytes());
             pseudo[39] = TCP_PROTOCOL;
-            cksm.add_bytes(&pseudo);
+            sum = ones_sum(&pseudo);
             IPV6_HEADER_LEN
         }
         _ => unreachable!(),
@@ -126,14 +124,47 @@ pub fn build_tcp_packet_into(
     }
     // Header and pseudo-header are even-length, so the payload can be summed
     // separately without disturbing 16-bit word alignment.
-    cksm.add_bytes(tcp_hdr);
-    cksm.add_bytes(payload);
-    tcp_hdr[16..18].copy_from_slice(&cksm.checksum());
+    sum += ones_sum(tcp_hdr);
+    sum += ones_sum(payload);
+    tcp_hdr[16..18].copy_from_slice(&fold_checksum(sum));
 
     buf.clear();
     buf.reserve(header_len + payload.len());
     buf.extend_from_slice(&hdr[..header_len]);
     buf.extend_from_slice(payload);
+}
+
+/// Unfolded one's-complement sum of `bytes` taken as native-endian 16-bit
+/// words (RFC 1071 §2(B): the sum is byte-order independent, so the folded
+/// result is stored back with `to_ne_bytes`). An odd trailing byte is padded
+/// with zero. 32-bit words are accumulated into a `u64` without a carry chain,
+/// which LLVM vectorises; overflow needs >16 GiB of input.
+#[inline(always)]
+fn ones_sum(bytes: &[u8]) -> u64 {
+    let mut chunks = bytes.chunks_exact(4);
+    let mut acc: u64 = 0;
+    for c in &mut chunks {
+        acc += u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) as u64;
+    }
+    let rem = chunks.remainder();
+    if rem.len() >= 2 {
+        acc += u16::from_ne_bytes([rem[0], rem[1]]) as u64;
+    }
+    if rem.len() & 1 == 1 {
+        acc += u16::from_ne_bytes([rem[rem.len() - 1], 0]) as u64;
+    }
+    acc
+}
+
+/// Folds an unfolded sum from [`ones_sum`] into the final 16-bit checksum.
+#[inline(always)]
+fn fold_checksum(sum: u64) -> [u8; 2] {
+    let mut s = (sum & 0xffff_ffff) + (sum >> 32);
+    s = (s & 0xffff_ffff) + (s >> 32);
+    let mut s = (s & 0xffff) + (s >> 16);
+    s = (s & 0xffff) + (s >> 16);
+    s = (s & 0xffff) + (s >> 16);
+    (!(s as u16)).to_ne_bytes()
 }
 
 pub fn parse_ip_packet(buf: &Bytes) -> Option<(IPPacket<'_>, tcp::TcpPacket<'_>)> {
