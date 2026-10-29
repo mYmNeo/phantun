@@ -78,15 +78,22 @@ pub fn build_tcp_packet_into(
             ip[9] = TCP_PROTOCOL;
             ip[12..16].copy_from_slice(&local.ip().octets());
             ip[16..20].copy_from_slice(&remote.ip().octets());
-            let ip_cksm = fold_checksum(ones_sum(ip));
-            ip[10..12].copy_from_slice(&ip_cksm);
+            // Both the IP header checksum and the TCP pseudo-header cover the
+            // address pair; sum it once. The remaining non-zero IP header words
+            // are 0x4500, total_len, 0x4000 (DF) and TTL/proto.
+            let addr_sum = ones_sum(&ip[12..20]);
+            let proto_word = u16::from_ne_bytes([0, TCP_PROTOCOL]) as u64;
+            let ip_sum = addr_sum
+                + u16::from_ne_bytes([0x45, 0]) as u64
+                + u16::from_ne_bytes(total_len.to_be_bytes()) as u64
+                + u16::from_ne_bytes([0x40, 0]) as u64
+                + u16::from_ne_bytes([64, TCP_PROTOCOL]) as u64;
+            ip[10..12].copy_from_slice(&fold_checksum(ip_sum));
 
             // TCP pseudo-header: src, dst, zero, proto, tcp length.
-            let mut pseudo = [0u8; 12];
-            pseudo[..8].copy_from_slice(&ip[12..20]);
-            pseudo[9] = TCP_PROTOCOL;
-            pseudo[10..12].copy_from_slice(&(tcp_total_len as u16).to_be_bytes());
-            sum = ones_sum(&pseudo);
+            sum = addr_sum
+                + proto_word
+                + u16::from_ne_bytes((tcp_total_len as u16).to_be_bytes()) as u64;
             IPV4_HEADER_LEN
         }
         (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
